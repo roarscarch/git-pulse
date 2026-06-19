@@ -47,45 +47,58 @@ def find_config_file(repo_path: str = ".") -> Optional[Path]:
 
 
 def load_config_file(config_path: Path) -> Dict[str, Any]:
-    """Load configuration from a file."""
+    """Load configuration from a file. Supports YAML and JSON."""
     suffix = config_path.suffix.lower()
-    if suffix in (".yml", ".yaml"):
-        if not HAS_YAML:
-            raise ImportError("PyYAML is required to load YAML config files. Install with: pip install pyyaml")
-        with open(config_path, "r") as f:
-            return yaml.safe_load(f) or {}
-    elif suffix == ".json" or suffix == "":
-        # For files without suffix, try JSON first, then YAML
-        try:
-            with open(config_path, "r") as f:
+    with open(config_path, "r") as f:
+        if suffix in (".yml", ".yaml"):
+            if not HAS_YAML:
+                raise ImportError("PyYAML is required to load .yml config files. Install with: pip install pyyaml")
+            return yaml.safe_load(f)
+        elif suffix == ".json":
+            return json.load(f)
+        else:
+            # Try JSON first, then YAML (for files without extension)
+            try:
                 return json.load(f)
-        except json.JSONDecodeError:
-            if HAS_YAML:
-                with open(config_path, "r") as f:
-                    return yaml.safe_load(f) or {}
-            raise
-    else:
-        raise ValueError(f"Unsupported config file format: {suffix}")
+            except json.JSONDecodeError:
+                if not HAS_YAML:
+                    raise ImportError("PyYAML is required to load config files without extension. Install with: pip install pyyaml")
+                f.seek(0)
+                return yaml.safe_load(f)
 
 
-def load_config(repo_path: str = ".", cli_args: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """
-    Load configuration from file, environment variables, and CLI arguments.
-    Precedence: CLI > environment > config file > defaults.
+def load_config(repo_path: str = ".", config_path: Optional[str] = None) -> Dict[str, Any]:
+    """Load configuration from file, environment variables, and defaults.
+
+    Priority (highest to lowest):
+    1. Environment variables (GIT_PULSE_*)
+    2. Config file (custom or discovered)
+    3. Default values
+
+    Args:
+        repo_path: Path to the git repository.
+        config_path: Optional explicit path to config file. If provided, only this file is used.
+
+    Returns:
+        Dictionary of merged configuration settings.
     """
     config = DEFAULT_CONFIG.copy()
-    
-    # Load from config file
-    config_path = find_config_file(repo_path)
+
+    # Load from config file (if provided or discovered)
     if config_path:
-        try:
-            file_config = load_config_file(config_path)
+        cfg_file = Path(config_path).resolve()
+        if not cfg_file.exists():
+            raise FileNotFoundError(f"Config file not found: {cfg_file}")
+        file_config = load_config_file(cfg_file)
+        config.update(file_config)
+    else:
+        discovered = find_config_file(repo_path)
+        if discovered:
+            file_config = load_config_file(discovered)
             config.update(file_config)
-        except Exception as e:
-            print(f"Warning: Failed to load config from {config_path}: {e}")
-    
+
     # Override with environment variables
-    env_map = {
+    env_mapping = {
         "GIT_PULSE_REPO": "repo",
         "GIT_PULSE_MAX_COMMITS": "max_commits",
         "GIT_PULSE_BIN": "bin",
@@ -93,45 +106,39 @@ def load_config(repo_path: str = ".", cli_args: Optional[Dict[str, Any]] = None)
         "GIT_PULSE_POLYORDER": "polyorder",
         "GIT_PULSE_HIGHLIGHT_EVENTS": "highlight_events",
         "GIT_PULSE_OUTPUT": "output",
+        "GIT_PULSE_EVENT_KEYWORDS": "event_keywords",
     }
-    for env_var, config_key in env_map.items():
+    for env_var, config_key in env_mapping.items():
         if env_var in os.environ:
-            value = os.environ[env_var]
-            # Convert types
-            if config_key in ("max_commits", "window", "polyorder"):
-                value = int(value)
-            elif config_key == "highlight_events":
-                value = value.lower() in ("true", "1", "yes")
-            elif config_key == "bin":
-                if value not in ("hour", "day"):
-                    print(f"Warning: Invalid bin value '{value}', using 'day'")
-                    value = "day"
-            config[config_key] = value
-    
-    # Override with CLI arguments
-    if cli_args:
-        for cli_key, cli_value in cli_args.items():
-            if cli_value is not None:
-                config[cli_key] = cli_value
-    
+            raw_value = os.environ[env_var]
+            # Type conversion based on default
+            default_val = DEFAULT_CONFIG.get(config_key)
+            if isinstance(default_val, bool):
+                config[config_key] = raw_value.lower() in ("true", "1", "yes")
+            elif isinstance(default_val, int):
+                config[config_key] = int(raw_value)
+            elif isinstance(default_val, list):
+                config[config_key] = raw_value.split(",")
+            else:
+                config[config_key] = raw_value
+
     return config
 
 
-def save_config(config: Dict[str, Any], path: Path) -> None:
-    """Save configuration to a file."""
-    suffix = path.suffix.lower()
-    if suffix in (".yml", ".yaml"):
-        if not HAS_YAML:
-            raise ImportError("PyYAML is required to save YAML config files. Install with: pip install pyyaml")
-        with open(path, "w") as f:
-            yaml.dump(config, f, default_flow_style=False)
-    elif suffix == ".json":
-        with open(path, "w") as f:
-            json.dump(config, f, indent=2)
-    else:
-        raise ValueError(f"Unsupported config file format: {suffix}")
-
-
-def get_default_config_path() -> Path:
-    """Return the default config file path in the user's home directory."""
-    return Path.home() / ".git-pulse.yml"
+def merge_config_with_args(config: Dict[str, Any], args: Any) -> Dict[str, Any]:
+    """Merge CLI arguments into config dict. CLI args take precedence."""
+    arg_mapping = {
+        "repo": "repo",
+        "max_commits": "max_commits",
+        "bin": "bin",
+        "window": "window",
+        "polyorder": "polyorder",
+        "highlight_events": "highlight_events",
+        "output": "output",
+        "event_keywords": "event_keywords",
+    }
+    for arg_name, config_key in arg_mapping.items():
+        arg_value = getattr(args, arg_name, None)
+        if arg_value is not None:
+            config[config_key] = arg_value
+    return config
