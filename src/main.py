@@ -38,36 +38,40 @@ def add_sentiment_bands(ax: plt.Axes, bin_times: List[datetime], sentiments: Lis
     if len(bin_times) < 2:
         return
     # Define sentiment thresholds and colors
-    bands = [
-        (-1.0, -0.3, '#ffcccc', 'Negative'),
-        (-0.3, 0.3, '#ccccff', 'Neutral'),
-        (0.3, 1.0, '#ccffcc', 'Positive')
-    ]
-    times_num = mdates.date2num(bin_times)
-    for lo, hi, color, label in bands:
-        mask = np.logical_and(np.array(sentiments) >= lo, np.array(sentiments) <= hi)
-        if np.any(mask):
-            ax.fill_between(bin_times, lo, hi, where=mask, color=color, alpha=0.3, label=label if label not in [c.get_label() for c in ax.collections] else '')
+    bands = [(-1, -0.3, 'red'), (-0.3, 0.3, 'gray'), (0.3, 1, 'green')]
+    for lo, hi, color in bands:
+        mask = [lo <= s <= hi for s in sentiments]
+        if not any(mask):
+            continue
+        # Find contiguous regions
+        regions = []
+        start = None
+        for i, m in enumerate(mask):
+            if m and start is None:
+                start = i
+            elif not m and start is not None:
+                regions.append((start, i - 1))
+                start = None
+        if start is not None:
+            regions.append((start, len(mask) - 1))
+        for s, e in regions:
+            if s == e:
+                continue
+            ax.axvspan(bin_times[s], bin_times[e], alpha=0.1, color=color)
 
 
-def add_summary_stats(ax: plt.Axes, sentiments: List[float], bin_times: List[datetime], repo_path: str) -> None:
-    """Overlay summary statistics text box on the chart."""
+def add_summary_statistics(ax: plt.Axes, sentiments: List[float], bin_times: List[datetime]) -> None:
+    """Overlay summary statistics on the chart."""
     if not sentiments:
         return
-    arr = np.array(sentiments)
-    mean_val = np.mean(arr)
-    std_val = np.std(arr)
-    min_val = np.min(arr)
-    max_val = np.max(arr)
-    # Find time of best and worst sentiment
-    min_idx = np.argmin(arr)
-    max_idx = np.argmax(arr)
-    best_time = bin_times[max_idx].strftime('%Y-%m-%d %H:%M') if max_idx < len(bin_times) else 'N/A'
-    worst_time = bin_times[min_idx].strftime('%Y-%m-%d %H:%M') if min_idx < len(bin_times) else 'N/A'
+    mean_sent = np.mean(sentiments)
+    std_sent = np.std(sentiments)
+    max_sent = np.max(sentiments)
+    min_sent = np.min(sentiments)
+    median_sent = np.median(sentiments)
+    
     stats_text = (
-        f"Summary Statistics\n"
-        f"Mean: {mean_val:.3f}\n"
-        f"Std Dev: {std_val:.3f}\n"
-        f"Best: {max_val:.3f} ({best_time})\n"
-        f"Worst: {min_val:.3f} ({worst_time})\n"
-        f"Total bins: {len(sentiments)}
+        f"Mean: {mean_sent:.2f} ± {std_sent:.2f}\n"
+        f"Median: {median_sent:.2f}\n"
+        f"Max: {max_sent:.2f} | Min: {min_sent:.2f}\n"
+        f"Std Dev: {std_sent:.2f}
