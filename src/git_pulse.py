@@ -17,9 +17,28 @@ from textblob import TextBlob
 LOG_FORMAT = "%ci||%s"
 
 
-def get_git_log(repo_path: str = ".", max_count: int = 1000) -> List[str]:
-    """Retrieve git log entries from the repository."""
+def get_git_log(repo_path: str = ".", max_count: int = 1000, progress_callback=None) -> List[str]:
+    """Retrieve git log entries from the repository.
+
+    Args:
+        repo_path: Path to the git repository.
+        max_count: Maximum number of commits to retrieve.
+        progress_callback: Optional callable receiving (current, total) for progress updates.
+
+    Returns:
+        List of raw log entry strings.
+    """
     try:
+        # First, get total commit count for progress tracking
+        total_result = subprocess.run(
+            ["git", "-C", repo_path, "rev-list", "--count", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        total_commits = int(total_result.stdout.strip())
+        actual_count = min(total_commits, max_count)
+
         result = subprocess.run(
             ["git", "-C", repo_path, "log", f"--format={LOG_FORMAT}", f"--max-count={max_count}"],
             capture_output=True,
@@ -27,136 +46,101 @@ def get_git_log(repo_path: str = ".", max_count: int = 1000) -> List[str]:
             check=True
         )
         lines = result.stdout.strip().split('\n')
-        return [line for line in lines if line]  # filter empty lines
+        lines = [line for line in lines if line]  # filter empty lines
+
+        if progress_callback and actual_count > 0:
+            progress_callback(len(lines), actual_count)
+
+        return lines
     except subprocess.CalledProcessError as e:
-        print(f"Error running git log: {e}")
+        print(f"Error running git log: {e}", file=sys.stderr)
         return []
     except FileNotFoundError:
-        print("Git not found. Ensure git is installed and in PATH.")
+        print("Git not found. Ensure git is installed and in PATH.", file=sys.stderr)
         return []
 
 
 def parse_log_entry(entry: str) -> Tuple[Optional[datetime], Optional[str]]:
-    """Parse a single log entry into timestamp and message."""
-    # Entry format: 2023-10-05 14:30:00 +0200||Some commit message
-    parts = entry.split('||', 1)
-    if len(parts) != 2:
+    """Parse a single log entry into timestamp and message.
+
+    Expected format: "YYYY-MM-DD HH:MM:SS +HHMM||message"
+
+    Args:
+        entry: A single log entry string from get_git_log().
+
+    Returns:
+        Tuple of (datetime, message) or (None, None) on failure.
+    """
+    if not entry or '||' not in entry:
         return None, None
-    timestamp_str, message = parts
-    # Parse timestamp: 2023-10-05 14:30:00 +0200
-    # Remove timezone offset and parse as UTC
+
+    timestamp_str, message = entry.split('||', 1)
+    timestamp_str = timestamp_str.strip()
+    message = message.strip()
+
+    if not timestamp_str or not message:
+        return None, None
+
+    # Parse timestamp: '2024-01-15 14:30:00 +0000'
+    # Remove timezone offset for datetime parsing
     try:
-        # Remove timezone offset (e.g., +0200) and parse
-        timestamp_str_clean = timestamp_str.rsplit(' ', 1)[0]
-        timestamp = datetime.strptime(timestamp_str_clean, "%Y-%m-%d %H:%M:%S")
+        # Attempt to parse with timezone offset
+        timestamp = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S %z")
     except ValueError:
-        return None, None
+        try:
+            # Fallback: parse without timezone
+            clean_timestamp = re.sub(r'\s[+-]\d{4}$', '', timestamp_str)
+            timestamp = datetime.strptime(clean_timestamp, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None, None
+
     return timestamp, message
 
 
 def analyze_sentiment(message: str) -> float:
     """Analyze sentiment of a commit message using TextBlob.
-    Returns polarity between -1.0 (negative) and 1.0 (positive).
+
+    Args:
+        message: The commit message to analyze.
+
+    Returns:
+        Sentiment polarity score in [-1.0, 1.0].
     """
     if not message:
         return 0.0
+
     blob = TextBlob(message)
     return blob.sentiment.polarity
 
 
-def bin_sentiments(timestamps: List[datetime], sentiments: List[float], bin_size: str = "day") -> Tuple[List[datetime], List[float]]:
-    """Bin sentiment scores by hour or day, returning averaged values."""
+def bin_sentiments(
+    timestamps: List[datetime],
+    sentiments: List[float],
+    bin_size: str = "day"
+) -> Tuple[List[datetime], List[float], List[int]]:
+    """Bin sentiment scores by time interval.
+
+    Args:
+        timestamps: List of datetime objects for each commit.
+        sentiments: List of sentiment scores corresponding to timestamps.
+        bin_size: "hour" or "day" for aggregation interval.
+
+    Returns:
+        Tuple of (bin_timestamps, average_sentiments, commit_counts).
+    """
     if not timestamps or not sentiments:
-        return [], []
-    
-    from collections import defaultdict
-    
-    bins = defaultdict(list)
-    for ts, sent in zip(timestamps, sentiments):
+        return [], [], []
+
+    # Normalize timestamps to bin boundaries
+    binned: dict = {}
+
+    for ts, score in zip(timestamps, sentiments):
+        if ts is None:
+            continue
         if bin_size == "hour":
             key = ts.replace(minute=0, second=0, microsecond=0)
         else:  # day
             key = ts.replace(hour=0, minute=0, second=0, microsecond=0)
-        bins[key].append(sent)
-    
-    sorted_keys = sorted(bins.keys())
-    binned_times = sorted_keys
-    binned_sentiments = [sum(bins[k]) / len(bins[k]) for k in sorted_keys]
-    return binned_times, binned_sentiments
 
-
-def smooth_signal(timestamps: List[datetime], sentiments: List[float], window: int = 5, polyorder: int = 2) -> Tuple[List[datetime], List[float]]:
-    """Apply Savitzky-Golay filter to smooth the sentiment signal."""
-    import numpy as np
-    from scipy.signal import savgol_filter
-    
-    if len(sentiments) < window:
-        return timestamps, sentiments
-    
-    # Ensure window is odd
-    if window % 2 == 0:
-        window += 1
-    if window > len(sentiments):
-        window = len(sentiments) if len(sentiments) % 2 == 1 else len(sentiments) - 1
-    
-    try:
-        smoothed = savgol_filter(sentiments, window, polyorder)
-    except Exception:
-        # Fallback to moving average if Savitzky-Golay fails
-        smoothed = np.convolve(sentiments, np.ones(window)/window, mode='same')
-    
-    return timestamps, smoothed.tolist()
-
-
-def detect_events(timestamps: List[datetime], messages: List[str], keywords: List[str] = None) -> List[Tuple[datetime, str]]:
-    """Detect major events based on keywords in commit messages."""
-    if keywords is None:
-        keywords = ["release", "v1.0", "major", "refactor", "fix", "breaking"]
-    
-    events = []
-    for ts, msg in zip(timestamps, messages):
-        if msg is None:
-            continue
-        msg_lower = msg.lower()
-        for kw in keywords:
-            if kw.lower() in msg_lower:
-                events.append((ts, msg[:60]))  # Truncate long messages
-                break
-    return events
-
-
-def process_git_log(repo_path: str = ".", max_commits: int = 1000, show_progress: bool = True) -> Tuple[List[datetime], List[str], List[float], List[Tuple[datetime, str]]]:
-    """Full pipeline: fetch git log, parse, analyze sentiment, detect events.
-    Returns timestamps, messages, sentiments, and events.
-    """
-    print("Fetching git log...")
-    raw_entries = get_git_log(repo_path, max_commits)
-    if not raw_entries:
-        print("No git log entries found.")
-        return [], [], [], []
-    
-    print(f"Parsing {len(raw_entries)} commit entries...")
-    timestamps = []
-    messages = []
-    for entry in raw_entries:
-        ts, msg = parse_log_entry(entry)
-        if ts is not None and msg is not None:
-            timestamps.append(ts)
-            messages.append(msg)
-    
-    print(f"Analyzing sentiment for {len(messages)} commit messages...")
-    sentiments = []
-    total = len(messages)
-    for i, msg in enumerate(messages):
-        sentiments.append(analyze_sentiment(msg))
-        if show_progress and (i + 1) % 100 == 0:
-            sys.stdout.write(f"\rProgress: {i+1}/{total} commits analyzed")
-            sys.stdout.flush()
-    if show_progress and total > 0:
-        sys.stdout.write(f"\rProgress: {total}/{total} commits analyzed\n")
-        sys.stdout.flush()
-    
-    print("Detecting events...")
-    events = detect_events(timestamps, messages)
-    
-    return timestamps, messages, sentiments, events
+        if key not in binned:
+            binned[key] = {"total": 0.0, "count": 0}
