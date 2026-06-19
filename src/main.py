@@ -12,6 +12,7 @@ from typing import List, Tuple
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.patches import FancyBboxPatch
+from matplotlib.animation import FuncAnimation
 import numpy as np
 
 from src.git_pulse import get_git_log, parse_log_entry, analyze_sentiment, bin_sentiments, smooth_signal, detect_events
@@ -27,6 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--polyorder", type=int, default=2, help="Polynomial order for Savitzky-Golay filter (default: 2)")
     parser.add_argument("--highlight-events", action="store_true", help="Annotate major events on the chart")
     parser.add_argument("--event-keywords", nargs="*", default=["release", "v1.0", "major", "refactor", "fix", "breaking"], help="Keywords to detect as major events (default: release v1.0 major refactor fix breaking)")
+    parser.add_argument("--live", action="store_true", help="Enable live-updating pulse chart (re-scans repo every 5 seconds)")
     return parser.parse_args()
 
 
@@ -40,98 +42,102 @@ def add_sentiment_bands(ax: plt.Axes, bin_times: List[datetime], sentiments: Lis
         (-0.2, 0.2, 'neutral', '#fff3cd', 0.10),
         (-1.0, -0.2, 'negative', '#f8d7da', 0.15),
     ]
-    for lower, upper, label, color, alpha in bands:
-        ax.axhspan(lower, upper, facecolor=color, alpha=alpha, label=label if label not in [p.get_label() for p in ax.patches] else "")
+    for low, high, label, color, alpha in bands:
+        ax.axhspan(low, high, xmin=0, xmax=1, facecolor=color, alpha=alpha, label=label if low == 0.2 else "")
 
 
-def add_trend_line(ax: plt.Axes, bin_times: List[datetime], raw_sentiments: List[float], smooth_sentiments: List[float]) -> None:
-    """Add a trend line with confidence interval shading based on raw sentiment variability."""
-    if len(bin_times) < 3:
+def add_confidence_interval(ax: plt.Axes, bin_times: List[datetime], sentiments: List[float]) -> None:
+    """Add shaded confidence interval around the smoothed sentiment line."""
+    if len(sentiments) < 2:
         return
-    bin_times_arr = np.array([t.timestamp() for t in bin_times])
+    sorted_data = sorted(zip(bin_times, sentiments), key=lambda x: x[0])
+    times = [d[0] for d in sorted_data]
+    vals = [d[1] for d in sorted_data]
+    if len(vals) < 2:
+        return
     # Compute rolling standard deviation for confidence interval
-    window = min(5, len(raw_sentiments))
-    if window < 2:
-        return
-    std_devs = []
-    for i in range(len(raw_sentiments)):
-        start = max(0, i - window // 2)
-        end = min(len(raw_sentiments), i + window // 2 + 1)
-        segment = raw_sentiments[start:end]
-        if len(segment) >= 2:
-            std_devs.append(np.std(segment))
-        else:
-            std_devs.append(0.0)
-    std_arr = np.array(std_devs)
-    # Use the smoothed signal as the trend line
-    trend = np.array(smooth_sentiments)
-    # Shade one standard deviation above and below
-    ax.fill_between(bin_times_arr, trend - std_arr, trend + std_arr, color='gray', alpha=0.2, label='Confidence interval')
-    # Plot the trend line
-    ax.plot(bin_times_arr, trend, color='blue', linewidth=2, linestyle='--', label='Trend')
+    window = min(5, len(vals))
+    std = np.array([np.std(vals[max(0,i-window):i+1]) for i in range(len(vals))])
+    upper = np.array(vals) + 1.96 * std
+    lower = np.array(vals) - 1.96 * std
+    ax.fill_between(times, lower, upper, alpha=0.2, color='blue', label='95% CI')
 
 
-def add_annotated_spikes(ax: plt.Axes, bin_times: List[datetime], sentiments: List[float], events: List[Tuple[datetime, str]]) -> None:
-    """Annotate major events as annotated spikes on the chart."""
-    if not events:
-        return
-    for event_time, event_message in events:
-        # Find the closest bin time
-        if event_time < bin_times[0] or event_time > bin_times[-1]:
-            continue
-        idx = min(range(len(bin_times)), key=lambda i: abs(bin_times[i] - event_time))
-        event_x = bin_times[idx]
-        event_y = sentiments[idx] if idx < len(sentiments) else 0
-        ax.annotate(event_message, xy=(event_x, event_y), xytext=(event_x, event_y + 0.3),
-                     arrowprops=dict(arrowstyle='->', color='red', lw=1.5),
-                     fontsize=9, color='darkred', ha='center',
-                     bbox=dict(boxstyle='round,pad=0.3', facecolor='lightyellow', edgecolor='red', alpha=0.8))
+def add_event_annotations(ax: plt.Axes, events: List[Tuple[datetime, str]]) -> None:
+    """Annotate major events on the chart with styled markers."""
+    for event_time, label in events:
+        ax.annotate(
+            label,
+            xy=(event_time, 0.5),
+            xytext=(event_time, 0.85),
+            arrowprops=dict(arrowstyle="->", color='red', lw=1.5),
+            fontsize=8,
+            color='darkred',
+            ha='center',
+            bbox=dict(boxstyle="round,pad=0.3", facecolor='yellow', alpha=0.7)
+        )
 
 
-def plot_pulse(bin_times: List[datetime], raw_sentiments: List[float], smooth_sentiments: List[float],
-               events: List[Tuple[datetime, str]], output: str = None) -> None:
-    """Render the pulse chart with sentiment bands, trend line, and annotated spikes."""
-    if not bin_times or not smooth_sentiments:
-        print("No data to plot.")
-        return
-
-    fig, ax = plt.subplots(figsize=(12, 6))
-    fig.patch.set_facecolor('#f7f9fc')
-    ax.set_facecolor('#f7f9fc')
-
-    # Plot the smoothed pulse line
-    bin_times_arr = np.array([t.timestamp() for t in bin_times])
-    ax.plot(bin_times_arr, smooth_sentiments, color='#2c3e50', linewidth=2, label='Sentiment pulse')
-
+def render_chart(bin_times, bin_sentiments, smoothed, events, args, ax=None):
+    """Render the pulse chart on the given axes (or create new figure)."""
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(12, 6))
+    else:
+        fig = ax.figure
+    
+    ax.clear()
+    
+    # Plot raw sentiment points
+    ax.scatter(bin_times, bin_sentiments, c='gray', alpha=0.4, s=10, label='Raw sentiment')
+    
+    # Plot smoothed line
+    if smoothed is not None and len(smoothed) > 0:
+        ax.plot(bin_times, smoothed, color='blue', linewidth=2, label='Smoothed sentiment')
+        add_confidence_interval(ax, bin_times, smoothed)
+    
     # Add sentiment bands
-    add_sentiment_bands(ax, bin_times, smooth_sentiments)
-
-    # Add trend line with confidence interval
-    add_trend_line(ax, bin_times, raw_sentiments, smooth_sentiments)
-
-    # Add annotated spikes for events
-    if events:
-        add_annotated_spikes(ax, bin_times, smooth_sentiments, events)
-
-    # Format x-axis
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d' if len(bin_times) > 50 else '%Y-%m-%d %H:%M'))
+    add_sentiment_bands(ax, bin_times, bin_sentiments)
+    
+    # Add event annotations
+    if args.highlight_events and events:
+        add_event_annotations(ax, events)
+    
+    # Formatting
+    ax.set_xlabel('Time')
+    ax.set_ylabel('Sentiment Polarity')
+    ax.set_title(f"Git Pulse - {args.repo}")
+    ax.axhline(y=0, color='black', linestyle='--', linewidth=0.5)
+    ax.set_ylim(-1.0, 1.0)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
     fig.autofmt_xdate()
-
-    # Labels and title
-    ax.set_xlabel('Time', fontsize=12)
-    ax.set_ylabel('Sentiment polarity', fontsize=12)
-    ax.set_title('Repository Emotional Pulse', fontsize=14, fontweight='bold')
-    ax.legend(loc='best')
+    ax.legend(loc='upper right')
     ax.grid(True, alpha=0.3)
+    
+    return fig, ax
 
-    # Dynamic y-axis limits
-    all_vals = smooth_sentiments + [v for _, v in [(0, 0)]]
-    if all_vals:
-        margin = 0.1 * (max(all_vals) - min(all_vals)) if max(all_vals) != min(all_vals) else 0.1
-        ax.set_ylim(min(all_vals) - margin, max(all_vals) + margin)
 
-    plt.tight_layout()
-
-    if output:
-        plt.savefig(output, dpi=150, bbox_inches='tight')
-        print(f"Chart saved to {output}
+def main():
+    args = parse_args()
+    
+    if args.live:
+        # Live-updating mode: re-fetch data every 5 seconds and update chart
+        plt.ion()
+        fig, ax = plt.subplots(figsize=(12, 6))
+        
+        def update(frame):
+            nonlocal ax
+            print(f"Updating pulse chart (frame {frame})...")
+            try:
+                raw_log = get_git_log(args.repo, args.max_commits)
+                entries = [parse_log_entry(line) for line in raw_log if line.strip()]
+                sentiments = [analyze_sentiment(msg) for _, msg in entries]
+                bin_times, bin_sentiments = bin_sentiments(entries, sentiments, args.bin)
+                smoothed = smooth_signal(bin_sentiments, args.window, args.polyorder)
+                events = []
+                if args.highlight_events:
+                    events = detect_events(entries, args.event_keywords)
+                render_chart(bin_times, bin_sentiments, smoothed, events, args, ax)
+                fig.canvas.draw()
+            except Exception as e:
+                print(f"Error updating chart: {e}
