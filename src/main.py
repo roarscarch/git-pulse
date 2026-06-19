@@ -30,6 +30,35 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def add_sentiment_bands(ax: plt.Axes, bin_times: List[datetime], sentiments: List[float]) -> None:
+    """Add color-coded sentiment bands to the chart background."""
+    if len(bin_times) < 2:
+        return
+    # Define sentiment thresholds and colors
+    bands = [
+        (0.2, 1.0, 'positive', '#d4edda', 0.15),
+        (-0.2, 0.2, 'neutral', '#fff3cd', 0.10),
+        (-1.0, -0.2, 'negative', '#f8d7da', 0.15),
+    ]
+    for low, high, label, color, alpha in bands:
+        ax.axhspan(low, high, facecolor=color, alpha=alpha, label=label if not ax.get_legend_handles_labels()[0] else "")
+    # Add a horizontal line at zero
+    ax.axhline(y=0, color='gray', linestyle='--', linewidth=0.8, alpha=0.7)
+
+
+def set_dynamic_yaxis(ax: plt.Axes, sentiments: List[float]) -> None:
+    """Set y-axis limits dynamically based on data range."""
+    if not sentiments:
+        ax.set_ylim(-1.0, 1.0)
+        return
+    min_val = min(sentiments)
+    max_val = max(sentiments)
+    padding = max(0.2, (max_val - min_val) * 0.15)
+    lower = min(-1.0, min_val - padding)
+    upper = max(1.0, max_val + padding)
+    ax.set_ylim(lower, upper)
+
+
 def generate_pulse_chart(
     timestamps: List[datetime],
     sentiments: List[float],
@@ -38,134 +67,82 @@ def generate_pulse_chart(
     polyorder: int = 2,
     highlight_events: bool = False,
     events: List[Tuple[datetime, str]] = None,
-    output_path: str = None
+    output: str = None
 ) -> None:
-    """Generate and display/save the sentiment pulse chart."""
-    if not timestamps or not sentiments:
+    """Generate and display/save the pulse chart."""
+    if not timestamps:
         print("No data to plot.")
         return
 
-    # Bin sentiments
-    binned_times, binned_scores = bin_sentiments(timestamps, sentiments, bin_size)
-
-    if len(binned_scores) < window:
-        print("Not enough data points for smoothing. Displaying raw data.")
-        smoothed = binned_scores
-        times = binned_times
+    # Bin and smooth the sentiment data
+    bin_times, bin_sentiments = bin_sentiments(timestamps, sentiments, bin_size)
+    if len(bin_sentiments) < window:
+        print("Not enough data points for smoothing; displaying raw data.")
+        smoothed = bin_sentiments
     else:
-        # Smooth the signal
-        smoothed = smooth_signal(binned_scores, window, polyorder)
-        times = binned_times
+        smoothed = smooth_signal(bin_sentiments, window, polyorder)
 
     # Create the plot
-    fig, ax = plt.subplots(figsize=(12, 6))
-    fig.patch.set_facecolor('#f5f5f5')
-    ax.set_facecolor('#f5f5f5')
+    fig, ax = plt.subplots(figsize=(14, 6))
+    fig.patch.set_facecolor('#fafafa')
+    ax.set_facecolor('#fafafa')
 
-    # Plot smoothed pulse line
-    ax.plot(times, smoothed, color='#2c7bb6', linewidth=2, label='Sentiment Pulse', zorder=3)
-    ax.fill_between(times, 0, smoothed, alpha=0.15, color='#2c7bb6', zorder=2)
+    # Add sentiment bands
+    add_sentiment_bands(ax, bin_times, smoothed)
 
-    # Add horizontal zero line
-    ax.axhline(y=0, color='gray', linestyle='--', linewidth=0.8, alpha=0.5)
+    # Plot the pulse line
+    ax.plot(bin_times, smoothed, color='#1f77b4', linewidth=2.5, alpha=0.9, label='Sentiment')
+    ax.fill_between(bin_times, smoothed, 0, where=(np.array(smoothed) >= 0), color='#1f77b4', alpha=0.15)
+    ax.fill_between(bin_times, smoothed, 0, where=(np.array(smoothed) < 0), color='#d62728', alpha=0.15)
 
-    # Format x-axis
-    if bin_size == "hour":
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:00'))
-        ax.xaxis.set_major_locator(mdates.HourLocator(interval=6))
-    else:
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
-        ax.xaxis.set_major_locator(mdates.DayLocator(interval=7))
-    plt.xticks(rotation=45, ha='right')
-
-    # Highlight events if requested
+    # Annotate events
     if highlight_events and events:
-        for evt_time, evt_label in events:
-            # Find nearest time index
-            idx = np.searchsorted(times, evt_time)
-            if idx < len(times):
-                # Annotate with a spike marker
-                ax.annotate(
-                    evt_label,
-                    xy=(times[idx], smoothed[idx]),
-                    xytext=(times[idx], smoothed[idx] + 0.1 * max(abs(smoothed)) if max(abs(smoothed)) > 0 else 0.1),
-                    arrowprops=dict(arrowstyle='->', color='red', lw=1.5),
-                    fontsize=8,
-                    color='red',
-                    bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7),
-                    zorder=5
-                )
-                # Add a vertical line marker
-                ax.axvline(x=times[idx], color='red', linestyle=':', linewidth=1, alpha=0.6, zorder=4)
+        for evt_time, evt_msg in events:
+            # Find closest data point index
+            if not bin_times:
+                continue
+            diffs = [abs((evt_time - bt).total_seconds()) for bt in bin_times]
+            idx = diffs.index(min(diffs))
+            val = smoothed[idx] if idx < len(smoothed) else 0
+            ax.annotate(
+                evt_msg,
+                xy=(bin_times[idx], val),
+                xytext=(bin_times[idx], val + 0.25 if val >= 0 else val - 0.25),
+                arrowprops=dict(arrowstyle='->', color='black', lw=1.2),
+                fontsize=8,
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7),
+                ha='center'
+            )
 
-    # Labels and title
+    # Formatting
+    ax.set_title('Git Pulse — Repository Emotional Heartbeat', fontsize=16, fontweight='bold', pad=15)
     ax.set_xlabel('Time', fontsize=12)
     ax.set_ylabel('Sentiment Polarity', fontsize=12)
-    ax.set_title('Git Repository Emotional Pulse', fontsize=14, fontweight='bold')
-    ax.legend(loc='upper right')
-    ax.grid(True, alpha=0.3)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+    plt.xticks(rotation=45, ha='right')
+
+    # Dynamic y-axis limits
+    set_dynamic_yaxis(ax, smoothed)
+
+    # Legend
+    handles, labels = ax.get_legend_handles_labels()
+    if not any('positive' in l for l in labels):
+        # Add dummy entries for bands if not already added
+        from matplotlib.patches import Patch
+        band_handles = [
+            Patch(facecolor='#d4edda', alpha=0.4, label='Positive'),
+            Patch(facecolor='#fff3cd', alpha=0.4, label='Neutral'),
+            Patch(facecolor='#f8d7da', alpha=0.4, label='Negative'),
+        ]
+        handles.extend(band_handles)
+        labels.extend(['Positive', 'Neutral', 'Negative'])
+    ax.legend(handles=handles, loc='upper left', fontsize=10)
+
+    ax.grid(True, linestyle='--', alpha=0.3)
 
     plt.tight_layout()
 
-    if output_path:
-        plt.savefig(output_path, dpi=150)
-        print(f"Chart saved to {output_path}")
-    else:
-        plt.show()
-
-
-def main() -> None:
-    """Main entry point for the CLI."""
-    args = parse_args()
-
-    # Load config if available
-    try:
-        from src.config import load_config
-        config = load_config(args.repo)
-        # Merge CLI args with config (CLI takes precedence)
-        for key, value in vars(args).items():
-            if value is not None:
-                config[key] = value
-    except ImportError:
-        config = vars(args)
-
-    repo_path = config.get("repo", ".")
-    max_commits = config.get("max_commits", 1000)
-    bin_size = config.get("bin", "day")
-    window = config.get("window", 5)
-    polyorder = config.get("polyorder", 2)
-    highlight_events = config.get("highlight_events", True)
-    output_path = config.get("output", None)
-    event_keywords = config.get("event_keywords", ["release", "v1.0", "major", "refactor", "fix", "breaking"])
-
-    print("Fetching git log...")
-    raw_entries = get_git_log(repo_path, max_commits)
-
-    if not raw_entries:
-        print("No commits found.")
-        sys.exit(1)
-
-    print("Parsing entries and analyzing sentiment...")
-    timestamps = []
-    sentiments = []
-    commit_messages = []
-    for entry in raw_entries:
-        ts, msg = parse_log_entry(entry)
-        if ts is None:
-            continue
-        score = analyze_sentiment(msg)
-        timestamps.append(ts)
-        sentiments.append(score)
-        commit_messages.append(msg)
-
-    if not timestamps:
-        print("No valid commit data.")
-        sys.exit(1)
-
-    # Detect major events from commit messages
-    events = []
-    if highlight_events:
-        print("Detecting major events...")
-        events = detect_events(timestamps, commit_messages, keywords=event_keywords)
-        if events:
-            print(f"Found {len(events)} events: {[e[1] for e in events]}
+    if output:
+        plt.savefig(output, dpi=300, bbox_inches='tight')
+        print(f"Pulse chart saved to {output}
