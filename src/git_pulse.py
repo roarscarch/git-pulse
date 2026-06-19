@@ -8,7 +8,7 @@ import re
 import sys
 from datetime import datetime
 from collections import deque
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Callable
 
 from textblob import TextBlob
 
@@ -17,7 +17,7 @@ from textblob import TextBlob
 LOG_FORMAT = "%ci||%s"
 
 
-def get_git_log(repo_path: str = ".", max_count: int = 1000, progress_callback=None) -> List[str]:
+def get_git_log(repo_path: str = ".", max_count: int = 1000, progress_callback: Optional[Callable[[int, int], None]] = None) -> List[str]:
     """Retrieve git log entries from the repository.
 
     Args:
@@ -38,77 +38,72 @@ def get_git_log(repo_path: str = ".", max_count: int = 1000, progress_callback=N
         )
         total_commits = int(total_result.stdout.strip())
         actual_count = min(total_commits, max_count)
+    except (subprocess.CalledProcessError, ValueError):
+        # Fallback: if we can't get count, just fetch
+        actual_count = max_count
+        if progress_callback:
+            progress_callback(0, actual_count)
+    else:
+        if progress_callback:
+            progress_callback(0, actual_count)
 
+    try:
         result = subprocess.run(
-            ["git", "-C", repo_path, "log", f"--format={LOG_FORMAT}", f"--max-count={max_count}"],
+            ["git", "-C", repo_path, "log", f"--max-count={actual_count}", f"--format={LOG_FORMAT}", "--date-order"],
             capture_output=True,
             text=True,
             check=True
         )
         lines = result.stdout.strip().split('\n')
-        lines = [line for line in lines if line]  # filter empty lines
-
-        if progress_callback and actual_count > 0:
-            progress_callback(len(lines), actual_count)
-
+        if lines == ['']:
+            return []
         return lines
     except subprocess.CalledProcessError as e:
         print(f"Error running git log: {e}", file=sys.stderr)
         return []
-    except FileNotFoundError:
-        print("Git not found. Ensure git is installed and in PATH.", file=sys.stderr)
-        return []
 
 
-def parse_log_entry(entry: str) -> Tuple[Optional[datetime], Optional[str]]:
-    """Parse a single log entry into timestamp and message.
-
-    Expected format: "YYYY-MM-DD HH:MM:SS +HHMM||message"
+def parse_log_entry(entry: str) -> Tuple[datetime, str]:
+    """Parse a single log entry into a timestamp and message.
 
     Args:
-        entry: A single log entry string from get_git_log().
+        entry: Raw log entry string in format "timestamp||message"
 
     Returns:
-        Tuple of (datetime, message) or (None, None) on failure.
+        Tuple of (datetime object, message string)
+
+    Raises:
+        ValueError: If the entry cannot be parsed.
     """
-    if not entry or '||' not in entry:
-        return None, None
+    # Split on the first occurrence of ||
+    parts = entry.split('||', 1)
+    if len(parts) != 2:
+        raise ValueError(f"Invalid log entry format: {entry}")
 
-    timestamp_str, message = entry.split('||', 1)
-    timestamp_str = timestamp_str.strip()
-    message = message.strip()
-
-    if not timestamp_str or not message:
-        return None, None
-
-    # Parse timestamp: '2024-01-15 14:30:00 +0000'
-    # Remove timezone offset for datetime parsing
+    timestamp_str, message = parts
+    # Parse timestamp in format: 2023-01-15 14:30:00 +0000
     try:
-        # Attempt to parse with timezone offset
-        timestamp = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S %z")
+        # Remove timezone offset for parsing, then add it back
+        timestamp_str_clean = re.sub(r'\s[+-]\d{4}$', '', timestamp_str)
+        timestamp = datetime.strptime(timestamp_str_clean, '%Y-%m-%d %H:%M:%S')
     except ValueError:
-        try:
-            # Fallback: parse without timezone
-            clean_timestamp = re.sub(r'\s[+-]\d{4}$', '', timestamp_str)
-            timestamp = datetime.strptime(clean_timestamp, "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            return None, None
+        raise ValueError(f"Invalid timestamp format: {timestamp_str}")
 
-    return timestamp, message
+    return timestamp, message.strip()
 
 
 def analyze_sentiment(message: str) -> float:
     """Analyze sentiment of a commit message using TextBlob.
 
     Args:
-        message: The commit message to analyze.
+        message: Commit message text.
 
     Returns:
-        Sentiment polarity score in [-1.0, 1.0].
+        Sentiment polarity score between -1.0 (negative) and 1.0 (positive).
+        Returns 0.0 for empty messages.
     """
     if not message:
         return 0.0
-
     blob = TextBlob(message)
     return blob.sentiment.polarity
 
@@ -117,30 +112,28 @@ def bin_sentiments(
     timestamps: List[datetime],
     sentiments: List[float],
     bin_size: str = "day"
-) -> Tuple[List[datetime], List[float], List[int]]:
-    """Bin sentiment scores by time interval.
+) -> Tuple[List[datetime], List[float]]:
+    """Bin sentiment scores by time period.
 
     Args:
-        timestamps: List of datetime objects for each commit.
-        sentiments: List of sentiment scores corresponding to timestamps.
-        bin_size: "hour" or "day" for aggregation interval.
+        timestamps: List of datetime objects corresponding to each sentiment.
+        sentiments: List of sentiment scores.
+        bin_size: Time bin size, either "hour" or "day".
 
     Returns:
-        Tuple of (bin_timestamps, average_sentiments, commit_counts).
+        Tuple of (bin_timestamps, average_sentiments) where each bin has
+        the average sentiment for that period.
     """
     if not timestamps or not sentiments:
-        return [], [], []
+        return [], []
 
-    # Normalize timestamps to bin boundaries
-    binned: dict = {}
+    # Determine bin key function
+    if bin_size == "hour":
+        def bin_key(dt: datetime) -> datetime:
+            return dt.replace(minute=0, second=0, microsecond=0)
+    else:  # default to day
+        def bin_key(dt: datetime) -> datetime:
+            return dt.replace(hour=0, minute=0, second=0, microsecond=0)
 
-    for ts, score in zip(timestamps, sentiments):
-        if ts is None:
-            continue
-        if bin_size == "hour":
-            key = ts.replace(minute=0, second=0, microsecond=0)
-        else:  # day
-            key = ts.replace(hour=0, minute=0, second=0, microsecond=0)
-
-        if key not in binned:
-            binned[key] = {"total": 0.0, "count": 0}
+    # Group sentiments by bin
+    bins = {}
