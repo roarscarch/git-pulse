@@ -44,129 +44,110 @@ def generate_pulse_chart(
         print("No data to plot.")
         return
 
+    # Sort by timestamp
+    paired = sorted(zip(timestamps, sentiments), key=lambda x: x[0])
+    timestamps, sentiments = zip(*paired) if paired else ([], [])
+
     # Bin sentiments
-    binned_times, binned_sentiments = bin_sentiments(timestamps, sentiments, bin_size)
+    binned_times, binned_scores = bin_sentiments(timestamps, sentiments, bin_size)
     if not binned_times:
         print("No binned data to plot.")
         return
 
-    # Convert to numeric values for smoothing
-    numeric_times = mdates.date2num(binned_times)
-    
-    # Apply smoothing
-    if len(binned_sentiments) >= window:
-        smoothed = smooth_signal(binned_sentiments, window=window, polyorder=polyorder)
-    else:
-        smoothed = binned_sentiments
+    # Smooth the signal
+    smoothed = smooth_signal(binned_scores, window=window, polyorder=polyorder)
 
-    # Create plot
+    # Plot
     fig, ax = plt.subplots(figsize=(12, 6))
-    
-    # Plot raw sentiments as scatter
-    ax.scatter(binned_times, binned_sentiments, alpha=0.4, s=20, color='gray', label='Raw sentiment')
-    
-    # Plot smoothed pulse line
-    ax.plot(binned_times, smoothed, color='#2ca02c', linewidth=2.5, label='Smoothed pulse', zorder=3)
-    
-    # Fill between zero and smoothed line for emphasis
-    ax.fill_between(binned_times, smoothed, 0, where=(np.array(smoothed) > 0), color='green', alpha=0.1)
-    ax.fill_between(binned_times, smoothed, 0, where=(np.array(smoothed) < 0), color='red', alpha=0.1)
-    
-    # Add zero line
-    ax.axhline(0, color='black', linewidth=0.8, linestyle='--', alpha=0.7)
-    
+    ax.plot(binned_times, binned_scores, color='lightgray', linewidth=1, label='Raw sentiment')
+    ax.plot(binned_times, smoothed, color='#2c7fb8', linewidth=2.5, label='Smoothed pulse')
+
+    # Fill between zero and smoothed
+    ax.fill_between(binned_times, 0, smoothed, where=(smoothed >= 0), color='#2c7fb8', alpha=0.15)
+    ax.fill_between(binned_times, 0, smoothed, where=(smoothed < 0), color='#d62728', alpha=0.15)
+
+    # Zero line
+    ax.axhline(y=0, color='gray', linestyle='--', linewidth=0.8, alpha=0.7)
+
+    # Event annotations
+    if highlight_events and events:
+        for evt_time, evt_label in events:
+            # Find nearest binned time
+            nearest_idx = min(range(len(binned_times)), key=lambda i: abs((binned_times[i] - evt_time).total_seconds()))
+            ax.annotate(
+                evt_label,
+                xy=(binned_times[nearest_idx], smoothed[nearest_idx]),
+                xytext=(10, 20),
+                textcoords='offset points',
+                arrowprops=dict(arrowstyle='->', color='#e67e22', lw=1.5),
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='#f39c12', alpha=0.2),
+                fontsize=9,
+                color='black'
+            )
+
     # Formatting
-    ax.set_xlabel('Date')
-    ax.set_ylabel('Sentiment Polarity')
-    ax.set_title('Git Pulse - Repository Emotional Arc')
-    ax.legend(loc='upper right')
+    ax.set_xlabel('Time', fontsize=12)
+    ax.set_ylabel('Sentiment polarity', fontsize=12)
+    ax.set_title('Git Pulse - Repository Emotional Arc', fontsize=14, fontweight='bold')
+    ax.legend(loc='best', fontsize=10)
     ax.grid(True, alpha=0.3)
-    
-    # Format x-axis dates
+    ax.axhline(y=0, color='gray', linestyle='--', linewidth=0.8, alpha=0.7)
+
+    # Date formatting
     if bin_size == 'hour':
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
-        fig.autofmt_xdate(rotation=45)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:00'))
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator())
     else:
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
-        fig.autofmt_xdate(rotation=45)
-    
-    # Highlight events if requested
-    if highlight_events and events:
-        for ev_time, ev_label in events:
-            # Find nearest binned time
-            if binned_times:
-                # Convert event time to numeric
-                ev_num = mdates.date2num(ev_time)
-                # Find closest binned time index
-                diffs = [abs(mdates.date2num(t) - ev_num) for t in binned_times]
-                min_idx = diffs.index(min(diffs))
-                nearest_time = binned_times[min_idx]
-                nearest_sent = smoothed[min_idx]
-                
-                # Annotate with arrow
-                ax.annotate(
-                    ev_label,
-                    xy=(nearest_time, nearest_sent),
-                    xytext=(nearest_time, nearest_sent + 0.15 * (1 if nearest_sent >= 0 else -1)),
-                    arrowprops=dict(arrowstyle='->', color='darkorange', lw=1.5),
-                    fontsize=8,
-                    color='darkorange',
-                    ha='center'
-                )
-                # Add a marker at the event
-                ax.scatter(nearest_time, nearest_sent, color='darkorange', s=80, zorder=5, marker='*')
-    
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+
+    plt.xticks(rotation=45)
     plt.tight_layout()
-    
+
     if output_path:
         plt.savefig(output_path, dpi=150)
         print(f"Chart saved to {output_path}")
     else:
         plt.show()
-    plt.close()
 
 
-def main():
-    """Main entry point for git-pulse CLI."""
+def main() -> None:
+    """Main entry point for Git Pulse."""
     args = parse_args()
-    
-    print(f"Scanning git repository at: {args.repo}")
+
+    # Retrieve git log
     raw_entries = get_git_log(repo_path=args.repo, max_count=args.max_commits)
     if not raw_entries:
-        print("No commits found or error reading git log.")
+        print("No git log entries found. Exiting.")
         sys.exit(1)
-    
-    print(f"Found {len(raw_entries)} commits. Parsing...")
-    
-    timestamps = []
-    messages = []
+
+    # Parse entries
+    timestamps: List[datetime] = []
+    messages: List[str] = []
     for entry in raw_entries:
         ts, msg = parse_log_entry(entry)
         if ts and msg:
             timestamps.append(ts)
             messages.append(msg)
-    
+
     if not timestamps:
-        print("No valid commit messages to analyze.")
+        print("No valid commit data found.")
         sys.exit(1)
-    
-    print("Analyzing sentiment...")
-    sentiments = [analyze_sentiment(msg) for msg in messages]
-    
-    # Detect events if highlight requested
+
+    # Run sentiment analysis
+    sentiments = analyze_sentiment(messages)
+
+    # Detect events if requested
     events = None
     if args.highlight_events:
-        print("Detecting major events...")
-        events = detect_events(timestamps, messages)
-        if events:
-            print(f"Detected {len(events)} events")
-        else:
-            print("No events detected.")
-    
-    print("Generating pulse chart...")
+        # Use default keywords from git_pulse
+        event_keywords = ["release", "v1.0", "major", "refactor", "fix", "breaking"]
+        events = detect_events(timestamps, messages, keywords=event_keywords)
+
+    # Generate chart
     generate_pulse_chart(
-        timestamps,
-        sentiments,
+        timestamps=timestamps,
+        sentiments=sentiments,
         bin_size=args.bin,
         window=args.window,
         polyorder=args.polyorder,
