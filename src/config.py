@@ -23,7 +23,9 @@ DEFAULT_CONFIG = {
     "polyorder": 2,
     "highlight_events": True,
     "output": None,
-    "event_keywords": ["release", "v1.0", "major", "refactor", "fix", "breaking"]
+    "event_keywords": ["release", "v1.0", "major", "refactor", "fix", "breaking"],
+    "live": False,
+    "no_summary": False
 }
 
 
@@ -46,60 +48,74 @@ def find_config_file(repo_path: str = ".") -> Optional[Path]:
     return None
 
 
-def load_config_file(config_path: str) -> Dict[str, Any]:
-    """Load a configuration file (YAML or JSON) and return as dict."""
-    path = Path(config_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-    
-    suffix = path.suffix.lower()
+def load_config_file(config_path: Path) -> Dict[str, Any]:
+    """Load and parse a config file (YAML or JSON).
+
+    Args:
+        config_path: Path to the config file.
+
+    Returns:
+        Dictionary of config values.
+
+    Raises:
+        ValueError: If file format is unsupported or parsing fails.
+    """
+    suffix = config_path.suffix.lower()
     if suffix in (".yml", ".yaml"):
         if not HAS_YAML:
-            raise ImportError("PyYAML is required to load YAML config files. Install with: pip install pyyaml")
-        with open(path, "r") as f:
-            return yaml.safe_load(f)
-    elif suffix == ".json":
-        with open(path, "r") as f:
-            return json.load(f)
-    else:
-        # Try to parse as YAML first, then JSON
+            raise ValueError(
+                "YAML config file found but PyYAML is not installed. "
+                "Install with: pip install pyyaml"
+            )
+        with open(config_path, "r") as f:
+            return yaml.safe_load(f) or {}
+    elif suffix == ".json" or suffix == "":
+        # Also try parsing as JSON if no extension
         try:
-            if HAS_YAML:
-                with open(path, "r") as f:
-                    return yaml.safe_load(f)
-        except Exception:
-            pass
-        try:
-            with open(path, "r") as f:
+            with open(config_path, "r") as f:
                 return json.load(f)
-        except Exception:
-            raise ValueError(f"Unsupported config file format: {suffix}. Use .yml, .yaml, or .json.")
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in config file: {e}")
+    else:
+        raise ValueError(f"Unsupported config file format: {suffix}")
 
 
 def load_config(repo_path: str = ".", config_path: Optional[str] = None) -> Dict[str, Any]:
-    """Load configuration from file, environment variables, and defaults.
-    
+    """Load configuration from file, environment, and defaults.
+
     Priority (highest to lowest):
-    1. Environment variables (GIT_PULSE_*)
-    2. Config file (if provided or found automatically)
-    3. Default config
+    1. Explicitly provided config_path
+    2. Environment variables (GIT_PULSE_*)
+    3. Config file found in repo or home
+    4. Default config
+
+    Args:
+        repo_path: Path to the git repository.
+        config_path: Optional explicit path to a config file.
+
+    Returns:
+        Merged configuration dictionary.
     """
     config = DEFAULT_CONFIG.copy()
-    
-    # Load config file
+
+    # Load from config file if found
+    config_file = None
     if config_path:
-        file_config = load_config_file(config_path)
+        config_file = Path(config_path)
+        if not config_file.exists():
+            raise FileNotFoundError(f"Config file not found: {config_file}")
     else:
         config_file = find_config_file(repo_path)
-        if config_file:
-            file_config = load_config_file(str(config_file))
-        else:
-            file_config = {}
-    
-    config.update(file_config)
-    
+
+    if config_file:
+        try:
+            file_config = load_config_file(config_file)
+            config.update(file_config)
+        except ValueError as e:
+            print(f"Warning: Failed to load config file {config_file}: {e}", file=sys.stderr)
+
     # Environment variable overrides
-    env_map = {
+    env_mapping = {
         "GIT_PULSE_REPO": "repo",
         "GIT_PULSE_MAX_COMMITS": "max_commits",
         "GIT_PULSE_BIN": "bin",
@@ -108,71 +124,24 @@ def load_config(repo_path: str = ".", config_path: Optional[str] = None) -> Dict
         "GIT_PULSE_HIGHLIGHT_EVENTS": "highlight_events",
         "GIT_PULSE_OUTPUT": "output",
         "GIT_PULSE_EVENT_KEYWORDS": "event_keywords",
+        "GIT_PULSE_LIVE": "live",
+        "GIT_PULSE_NO_SUMMARY": "no_summary",
     }
-    for env_var, config_key in env_map.items():
+
+    for env_var, config_key in env_mapping.items():
         value = os.environ.get(env_var)
         if value is not None:
-            if config_key == "max_commits":
-                config[config_key] = int(value)
-            elif config_key == "window":
-                config[config_key] = int(value)
-            elif config_key == "polyorder":
-                config[config_key] = int(value)
-            elif config_key == "highlight_events":
-                config[config_key] = value.lower() in ("true", "1", "yes")
+            # Type conversions
+            if config_key in ("max_commits", "window", "polyorder"):
+                try:
+                    value = int(value)
+                except ValueError:
+                    print(f"Warning: Invalid integer for {env_var}: {value}", file=sys.stderr)
+                    continue
+            elif config_key in ("highlight_events", "live", "no_summary"):
+                value = value.lower() in ("true", "1", "yes")
             elif config_key == "event_keywords":
-                config[config_key] = [k.strip() for k in value.split(",")]
-            else:
-                config[config_key] = value
-    
+                value = [kw.strip() for kw in value.split(",") if kw.strip()]
+            config[config_key] = value
+
     return config
-
-
-def merge_config_with_cli(config: Dict[str, Any], args: Any) -> Dict[str, Any]:
-    """Merge config dict with CLI arguments. CLI args take precedence."""
-    result = config.copy()
-    cli_overrides = {
-        "repo": "repo",
-        "max_commits": "max_commits",
-        "bin": "bin",
-        "window": "window",
-        "polyorder": "polyorder",
-        "highlight_events": "highlight_events",
-        "output": "output",
-        "event_keywords": "event_keywords",
-    }
-    for cli_attr, config_key in cli_overrides.items():
-        cli_value = getattr(args, cli_attr, None)
-        if cli_value is not None:
-            result[config_key] = cli_value
-    return result
-
-
-def validate_config(config: Dict[str, Any]) -> None:
-    """Validate configuration values and raise errors if invalid."""
-    if not isinstance(config.get("max_commits"), int) or config["max_commits"] <= 0:
-        raise ValueError("max_commits must be a positive integer")
-    if config.get("bin") not in ("hour", "day"):
-        raise ValueError("bin must be 'hour' or 'day'")
-    if not isinstance(config.get("window"), int) or config["window"] <= 0:
-        raise ValueError("window must be a positive integer")
-    if not isinstance(config.get("polyorder"), int) or config["polyorder"] <= 0:
-        raise ValueError("polyorder must be a positive integer")
-    if config["polyorder"] >= config["window"]:
-        raise ValueError("polyorder must be less than window")
-    if not isinstance(config.get("event_keywords"), list):
-        raise ValueError("event_keywords must be a list of strings")
-    if config.get("output") is not None and not isinstance(config["output"], str):
-        raise ValueError("output must be a string or None")
-    if not isinstance(config.get("highlight_events"), bool):
-        raise ValueError("highlight_events must be a boolean")
-
-
-def print_config_summary(config: Dict[str, Any]) -> None:
-    """Print a summary of the active configuration."""
-    print("Git Pulse Configuration:")
-    print(f"  Repo: {config['repo']}")
-    print(f"  Max commits: {config['max_commits']}")
-    print(f"  Time bin: {config['bin']}")
-    print(f"  Smoothing window: {config['window']}")
-    print(f"  Polynomial order: {config['polyorder']}
