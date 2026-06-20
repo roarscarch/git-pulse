@@ -38,80 +38,26 @@ def add_sentiment_bands(ax: plt.Axes, bin_times: List[datetime], sentiments: Lis
     if len(bin_times) < 2:
         return
     # Define sentiment thresholds and colors
-    colors = {'negative': (0.8, 0.2, 0.2, 0.15), 'neutral': (0.8, 0.8, 0.8, 0.1), 'positive': (0.2, 0.8, 0.2, 0.15)}
+    bands = [
+        (0.3, 1.0, 'green', 0.1, 'Positive'),
+        (-0.1, 0.3, 'gray', 0.05, 'Neutral'),
+        (-1.0, -0.1, 'red', 0.1, 'Negative'),
+    ]
     y_min, y_max = ax.get_ylim()
-    for i in range(len(bin_times) - 1):
-        t_start = bin_times[i]
-        t_end = bin_times[i+1]
-        s = sentiments[i]
-        if s < -0.1:
-            color = colors['negative']
-        elif s > 0.1:
-            color = colors['positive']
-        else:
-            color = colors['neutral']
-        ax.axvspan(t_start, t_end, ymin=0, ymax=1, color=color, zorder=0)
+    for low, high, color, alpha, label in bands:
+        if y_min < high and y_max > low:
+            ax.axhspan(max(low, y_min), min(high, y_max), facecolor=color, alpha=alpha, label=label if label != 'Neutral' else '')
 
 
-def add_summary_stats(ax: plt.Axes, sentiments: List[float], times: List[datetime]) -> None:
-    """Overlay summary statistics on the chart."""
+def add_summary_stats(ax: plt.Axes, sentiments: List[float], bin_times: List[datetime]) -> None:
+    """Display summary statistics on the chart."""
     if not sentiments:
         return
     avg = np.mean(sentiments)
     std = np.std(sentiments)
-    median = np.median(sentiments)
-    max_val = np.max(sentiments)
-    min_val = np.min(sentiments)
-    text_str = (
-        f"Mean: {avg:.3f} +/- {std:.3f}\n"
-        f"Median: {median:.3f}\n"
-        f"Max: {max_val:.3f}, Min: {min_val:.3f}"
-    )
-    ax.text(0.02, 0.98, text_str, transform=ax.transAxes, fontsize=9,
-            verticalalignment='top', bbox=dict(boxstyle='round,pad=0.3', facecolor='wheat', alpha=0.5))
-
-
-def add_trend_line(ax: plt.Axes, bin_times: List[datetime], sentiments: List[float]) -> None:
-    """Add a smoothed trend line with confidence interval shading."""
-    if len(bin_times) < 3:
-        return
-    # Convert times to numeric for polynomial fit
-    x_num = mdates.date2num(bin_times)
-    # Fit a low-degree polynomial
-    coeffs = np.polyfit(x_num, sentiments, deg=2)
-    poly = np.poly1d(coeffs)
-    x_smooth = np.linspace(x_num.min(), x_num.max(), 200)
-    y_smooth = poly(x_smooth)
-    # Compute residuals for confidence interval
-    residuals = sentiments - poly(x_num)
-    std_res = np.std(residuals)
-    ci = 1.96 * std_res  # 95% confidence interval
-    # Plot trend line
-    ax.plot(mdates.num2date(x_smooth), y_smooth, color='blue', linestyle='--', linewidth=1.5, label='Trend (quadratic)')
-    # Shade confidence interval
-    ax.fill_between(mdates.num2date(x_smooth), y_smooth - ci, y_smooth + ci, color='blue', alpha=0.15, label='95% CI')
-    ax.legend(loc='upper right', fontsize=8)
-
-
-def render_chart(args: argparse.Namespace) -> None:
-    """Main chart rendering logic."""
-    print("Pulling git log...")
-    try:
-        raw_logs = get_git_log(args.repo, args.max_commits)
-    except RuntimeError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    if not raw_logs:
-        print("No commits found.")
-        sys.exit(0)
-
-    print(f"Parsing {len(raw_logs)} commits...")
-    entries = [parse_log_entry(line) for line in raw_logs]
-    entries = [e for e in entries if e is not None]
-
-    print("Analyzing sentiment...")
-    sentiments = [analyze_sentiment(msg) for _, msg in entries]
-    times = [dt for dt, _ in entries]
-
-    print(f"Binning by {args.bin}
+    max_s = np.max(sentiments)
+    min_s = np.min(sentiments)
+    # Position in axes coordinates
+    x_pos = 0.02
+    y_pos = 0.95
+    stats_text = f"Avg: {avg:.2f} ± {std:.2f}\nMax: {max_s:.2f}\nMin: {min_s:.2f}\nCount: {len(sentiments)}
