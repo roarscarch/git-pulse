@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Git Pulse - Configuration module for loading and managing persistent settings.
-Supports YAML and JSON config files, with environment variable overrides.
+Supports YAML and JSON config files, with CLI flag override.
 """
 
 import json
@@ -49,99 +49,77 @@ def find_config_file(repo_path: str = ".") -> Optional[Path]:
 
 
 def load_config_file(config_path: Path) -> Dict[str, Any]:
-    """Load and parse a config file (YAML or JSON).
-
-    Args:
-        config_path: Path to the config file.
-
-    Returns:
-        Dictionary of config values.
-
-    Raises:
-        ValueError: If file format is unsupported or parsing fails.
-    """
+    """Load configuration from a file. Supports YAML and JSON."""
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
     suffix = config_path.suffix.lower()
-    if suffix in (".yml", ".yaml"):
-        if not HAS_YAML:
-            raise ValueError(
-                "YAML config file found but PyYAML is not installed. "
-                "Install with: pip install pyyaml"
-            )
-        with open(config_path, "r") as f:
-            return yaml.safe_load(f) or {}
-    elif suffix == ".json" or suffix == "":
-        # Also try parsing as JSON if no extension
-        try:
-            with open(config_path, "r") as f:
-                return json.load(f)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Invalid JSON in config file: {e}")
-    else:
-        raise ValueError(f"Unsupported config file format: {suffix}")
-
-
-def load_config(repo_path: str = ".", config_path: Optional[str] = None) -> Dict[str, Any]:
-    """Load configuration from file, environment, and defaults.
-
-    Priority (highest to lowest):
-    1. Explicitly provided config_path
-    2. Environment variables (GIT_PULSE_*)
-    3. Config file found in repo or home
-    4. Default config
-
-    Args:
-        repo_path: Path to the git repository.
-        config_path: Optional explicit path to a config file.
-
-    Returns:
-        Merged configuration dictionary.
-    """
-    config = DEFAULT_CONFIG.copy()
-
-    # Load from config file if found
-    config_file = None
-    if config_path:
-        config_file = Path(config_path)
-        if not config_file.exists():
-            raise FileNotFoundError(f"Config file not found: {config_file}")
-    else:
-        config_file = find_config_file(repo_path)
-
-    if config_file:
-        try:
-            file_config = load_config_file(config_file)
-            config.update(file_config)
-        except ValueError as e:
-            print(f"Warning: Failed to load config file {config_file}: {e}", file=sys.stderr)
-
-    # Environment variable overrides
-    env_mapping = {
-        "GIT_PULSE_REPO": "repo",
-        "GIT_PULSE_MAX_COMMITS": "max_commits",
-        "GIT_PULSE_BIN": "bin",
-        "GIT_PULSE_WINDOW": "window",
-        "GIT_PULSE_POLYORDER": "polyorder",
-        "GIT_PULSE_HIGHLIGHT_EVENTS": "highlight_events",
-        "GIT_PULSE_OUTPUT": "output",
-        "GIT_PULSE_EVENT_KEYWORDS": "event_keywords",
-        "GIT_PULSE_LIVE": "live",
-        "GIT_PULSE_NO_SUMMARY": "no_summary",
-    }
-
-    for env_var, config_key in env_mapping.items():
-        value = os.environ.get(env_var)
-        if value is not None:
-            # Type conversions
-            if config_key in ("max_commits", "window", "polyorder"):
+    try:
+        with open(config_path, 'r') as f:
+            if suffix in ('.yml', '.yaml'):
+                if not HAS_YAML:
+                    raise ImportError("PyYAML is required for YAML config files. Install with: pip install pyyaml")
+                config = yaml.safe_load(f)
+            elif suffix == '.json':
+                config = json.load(f)
+            else:
+                # Try JSON first, then YAML
                 try:
-                    value = int(value)
-                except ValueError:
-                    print(f"Warning: Invalid integer for {env_var}: {value}", file=sys.stderr)
-                    continue
-            elif config_key in ("highlight_events", "live", "no_summary"):
-                value = value.lower() in ("true", "1", "yes")
-            elif config_key == "event_keywords":
-                value = [kw.strip() for kw in value.split(",") if kw.strip()]
-            config[config_key] = value
-
+                    config = json.load(f)
+                except json.JSONDecodeError:
+                    if not HAS_YAML:
+                        raise ImportError("PyYAML is required for YAML config files. Install with: pip install pyyaml")
+                    f.seek(0)
+                    config = yaml.safe_load(f)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load config file {config_path}: {e}")
+    if not isinstance(config, dict):
+        raise ValueError(f"Config file must contain a dictionary, got {type(config).__name__}")
     return config
+
+
+def merge_config(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge override config into base config. override takes precedence."""
+    merged = base.copy()
+    for key, value in override.items():
+        if value is not None:
+            merged[key] = value
+    return merged
+
+
+def load_config(repo_path: str = ".", config_file: Optional[str] = None) -> Dict[str, Any]:
+    """Load configuration with priority: CLI flag > config file > defaults."""
+    config = DEFAULT_CONFIG.copy()
+    
+    # If a config file is explicitly provided via CLI, load it
+    if config_file:
+        config_path = Path(config_file)
+        if not config_path.exists():
+            raise FileNotFoundError(f"Specified config file not found: {config_file}")
+        file_config = load_config_file(config_path)
+        config = merge_config(config, file_config)
+    else:
+        # Otherwise, search for a config file in the repo or home directory
+        found = find_config_file(repo_path)
+        if found:
+            file_config = load_config_file(found)
+            config = merge_config(config, file_config)
+    
+    return config
+
+
+def cli_overrides(args_namespace) -> Dict[str, Any]:
+    """Extract CLI argument overrides into a config dict."""
+    overrides = {}
+    # Map CLI argument names to config keys
+    mapping = {
+        'repo': 'repo',
+        'max_commits': 'max_commits',
+        'bin': 'bin',
+        'window': 'window',
+        'polyorder': 'polyorder',
+        'highlight_events': 'highlight_events',
+        'output': 'output',
+        'event_keywords': 'event_keywords',
+        'live': 'live',
+        'no_summary': 'no_summary'
+    }
