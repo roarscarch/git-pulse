@@ -42,49 +42,92 @@ def find_config_file(repo_path: str = ".") -> Optional[Path]:
         Path.home() / ".git-pulse.json",
         Path.home() / ".git-pulse",
     ]
-    for path in candidates:
-        if path.is_file():
-            return path
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
     return None
 
 
-def load_config_file(config_path: Path) -> Dict[str, Any]:
+def load_config_from_file(config_path: Path) -> Dict[str, Any]:
     """Load configuration from a YAML or JSON file."""
     suffix = config_path.suffix.lower()
-    if suffix in (".yaml", ".yml"):
+    if suffix in (".yml", ".yaml"):
         if not HAS_YAML:
             raise ImportError("PyYAML is required to load YAML config files. Install with: pip install pyyaml")
         with open(config_path, "r") as f:
             return yaml.safe_load(f)
-    elif suffix == ".json":
+    elif suffix == ".json" or suffix == "":
         with open(config_path, "r") as f:
             return json.load(f)
     else:
-        # Assume YAML if no extension or .git-pulse file
-        if not HAS_YAML:
-            raise ImportError("PyYAML is required to load config files. Install with: pip install pyyaml")
-        with open(config_path, "r") as f:
-            return yaml.safe_load(f)
+        raise ValueError(f"Unsupported config file format: {suffix}")
 
 
-def merge_configs(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
-    """Merge two config dictionaries, with override taking precedence."""
-    merged = base.copy()
-    for key, value in override.items():
-        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
-            merged[key] = merge_configs(merged[key], value)
+def load_config(repo_path: str = ".", config_override: Optional[str] = None) -> Dict[str, Any]:
+    """Load configuration with priority: CLI override > auto-detected file > defaults.
+
+    Args:
+        repo_path: Path to the git repository to search for config files.
+        config_override: Optional explicit path to a config file.
+
+    Returns:
+        Merged configuration dictionary.
+    """
+    config = dict(DEFAULT_CONFIG)
+
+    if config_override:
+        override_path = Path(config_override)
+        if override_path.is_file():
+            try:
+                file_config = load_config_from_file(override_path)
+                config.update(file_config)
+            except Exception as e:
+                raise RuntimeError(f"Failed to load config file '{override_path}': {e}")
         else:
-            merged[key] = value
-    return merged
+            raise FileNotFoundError(f"Config file not found: {override_path}")
+    else:
+        auto_path = find_config_file(repo_path)
+        if auto_path:
+            try:
+                file_config = load_config_from_file(auto_path)
+                config.update(file_config)
+            except Exception as e:
+                raise RuntimeError(f"Failed to load auto-detected config file '{auto_path}': {e}")
+
+    # Ensure repo path is resolved relative to config file location if no override
+    if not config_override and auto_path:
+        config["repo"] = str(auto_path.parent.resolve())
+    elif config_override:
+        config["repo"] = str(Path(config_override).parent.resolve())
+
+    return config
 
 
-def get_config(args: Any) -> Dict[str, Any]:
-    """Load configuration from file and CLI arguments, returning merged config."""
-    config = DEFAULT_CONFIG.copy()
+def get_config_mtime(config_path: Optional[Path]) -> Optional[float]:
+    """Return the last modification time of the config file, or None if not available.
 
-    # 1. Find config file (from CLI --config flag or auto-discover)
-    config_file = None
-    if hasattr(args, 'config') and args.config:
-        config_file = Path(args.config)
-        if not config_file.is_file():
-            raise FileNotFoundError(f"Config file not found: {args.config}
+    Useful for live mode to detect config changes.
+    """
+    if config_path is not None and config_path.is_file():
+        return config_path.stat().st_mtime
+    return None
+
+
+def config_has_changed(config_path: Optional[Path], last_mtime: Optional[float]) -> bool:
+    """Check if config file has been modified since last check.
+
+    Args:
+        config_path: Path to the config file.
+        last_mtime: Previously recorded modification timestamp.
+
+    Returns:
+        True if the file has been modified or is inaccessible.
+    """
+    if config_path is None:
+        return False
+    current_mtime = get_config_mtime(config_path)
+    if current_mtime is None:
+        return False
+    if last_mtime is None:
+        return True
+    return current_mtime > last_mtime
