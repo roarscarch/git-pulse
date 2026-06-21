@@ -38,115 +38,100 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--all", action="store_true", help="Scan all branches and merge commit messages into the pulse chart")
     parser.add_argument("--json", action="store_true", help="Output sentiment data as JSON instead of rendering chart")
-    return parser.parse_args()
+    args = parser.parse_args()
+    return args
 
 
-def compute_moving_average(scores: List[float], window: int = 5) -> List[float]:
-    """Compute simple moving average for smoothing."""
-    if window <= 1:
-        return scores
-    kernel = np.ones(window) / window
-    padded = np.pad(scores, (window - 1, 0), mode='edge')
-    smoothed = np.convolve(padded, kernel, mode='valid')
-    return smoothed.tolist()
+def build_sentiment_data(repo_path: str, max_commits: int, bin_unit: str, window: int, polyorder: int, highlight_events: bool, event_keywords: list, all_branches: bool) -> dict:
+    """Build a dictionary of sentiment data ready for JSON serialization."""
+    print("Scanning git log...", file=sys.stderr)
+    raw_logs = get_git_log(repo_path=repo_path, max_count=max_commits, all_branches=all_branches)
+    if not raw_logs:
+        print("No commits found.", file=sys.stderr)
+        return {"error": "No commits found."}
 
-
-def get_timestamp_bin(dt: datetime, bin_type: str) -> str:
-    """Format a datetime for binning."""
-    if bin_type == "hour":
-        return dt.strftime("%Y-%m-%d %H:00")
-    else:
-        return dt.strftime("%Y-%m-%d")
-
-
-def run_pulse(args: argparse.Namespace) -> None:
-    """Execute the git-pulse analysis and output."""
-    config = load_config(args.config) if args.config else {}
-    # Merge CLI args over config file, with CLI taking precedence
-    repo = args.repo or config.get("repo", ".")
-    max_commits = args.max_commits or config.get("max_commits", 1000)
-    bin_type = args.bin or config.get("bin", "day")
-    window = args.window or config.get("window", 5)
-    polyorder = args.polyorder or config.get("polyorder", 2)
-    highlight_events = args.highlight_events or config.get("highlight_events", True)
-    event_keywords = args.event_keywords or config.get("event_keywords", ["release", "v1.0", "major", "refactor", "fix", "breaking"])
-    live_mode = args.live or config.get("live", False)
-    no_summary = args.no_summary or config.get("no_summary", False)
-    output_path = args.output or config.get("output", None)
-    all_branches = args.all or config.get("all", False)
-    json_output = args.json
-
-    print(f"Scanning repository: {repo}")
-    try:
-        raw_log = get_git_log(repo_path=repo, max_count=max_commits, all_branches=all_branches)
-    except RuntimeError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    if not raw_log:
-        print("No commits found. Exiting.")
-        sys.exit(0)
-
-    entries = []
-    for line in raw_log:
-        entry = parse_log_entry(line)
-        if entry:
-            entries.append(entry)
-
+    print(f"Parsing {len(raw_logs)} commit(s)...", file=sys.stderr)
+    entries = [parse_log_entry(line) for line in raw_logs if parse_log_entry(line) is not None]
     if not entries:
-        print("No valid commit entries parsed. Exiting.")
-        sys.exit(0)
+        print("No valid commit entries.", file=sys.stderr)
+        return {"error": "No valid commit entries."}
 
-    print(f"Parsed {len(entries)} commit messages.")
+    print("Analyzing sentiment...", file=sys.stderr)
+    sentiments = []
+    for dt, msg in entries:
+        score = analyze_sentiment(msg)
+        sentiments.append((dt, score, msg))
 
-    # Analyze sentiment
-    for entry in entries:
-        entry['sentiment'] = analyze_sentiment(entry['message'])
-
-    # Bin sentiments
-    binned = bin_sentiments(entries, bin_type=bin_type)
+    print("Binning sentiments...", file=sys.stderr)
+    binned = bin_sentiments(sentiments, unit=bin_unit)
     if not binned:
-        print("No sentiment data after binning. Exiting.")
-        sys.exit(0)
+        print("No binned data.", file=sys.stderr)
+        return {"error": "No binned data."}
 
-    times = [b['time'] for b in binned]
-    scores = [b['score'] for b in binned]
+    times = [t for t, _ in binned]
+    scores = [s for _, s in binned]
 
-    # Smooth
+    print("Smoothing signal...", file=sys.stderr)
     smoothed = smooth_signal(scores, window=window, polyorder=polyorder)
 
-    # Detect events
-    events = detect_events(entries, keywords=event_keywords) if highlight_events else []
+    events = []
+    if highlight_events:
+        events = detect_events(sentiments, keywords=event_keywords)
 
-    # Compute summary statistics
-    if not no_summary:
-        total_commits = len(entries)
-        avg_sentiment = sum(scores) / len(scores) if scores else 0.0
-        max_sentiment = max(scores) if scores else 0.0
-        min_sentiment = min(scores) if scores else 0.0
-        positive_count = sum(1 for s in scores if s > 0)
-        negative_count = sum(1 for s in scores if s < 0)
-        neutral_count = sum(1 for s in scores if s == 0)
-        print("\
---- Sentiment Summary ---")
-        print(f"Total commits: {total_commits}")
-        print(f"Average sentiment: {avg_sentiment:.4f}")
-        print(f"Max sentiment: {max_sentiment:.4f}")
-        print(f"Min sentiment: {min_sentiment:.4f}")
-        print(f"Positive commits: {positive_count}")
-        print(f"Negative commits: {negative_count}")
-        print(f"Neutral commits: {neutral_count}")
-        print("------------------------\
-")
-
-    # If JSON output requested, print and exit
-    if json_output:
-        output_data = {
-            "metadata": {
-                "repo": repo,
-                "total_commits": len(entries),
-                "bin_type": bin_type,
-                "window": window,
-                "polyorder": polyorder,
-                "all_branches": all_branches
+    # Build JSON-friendly structure
+    data = {
+        "repo": repo_path,
+        "max_commits": max_commits,
+        "bin_unit": bin_unit,
+        "total_commits": len(entries),
+        "times": [t.isoformat() for t in times],
+        "scores": scores,
+        "smoothed_scores": smoothed.tolist() if isinstance(smoothed, np.ndarray) else smoothed,
+        "events": [
+            {
+                "time": dt.isoformat(),
+                "message": msg,
+                "score": score
             }
+            for dt, score, msg in events
+        ],
+        "summary": {
+            "mean_score": float(np.mean(smoothed)) if len(smoothed) > 0 else 0.0,
+            "std_score": float(np.std(smoothed)) if len(smoothed) > 0 else 0.0,
+            "max_score": float(np.max(smoothed)) if len(smoothed) > 0 else 0.0,
+            "min_score": float(np.min(smoothed)) if len(smoothed) > 0 else 0.0
+        }
+    }
+    return data
+
+
+def render_chart(data: dict, output: Optional[str] = None, no_summary: bool = False):
+    """Render the pulse chart from sentiment data."""
+    times = [datetime.fromisoformat(t) for t in data["times"]]
+    scores = data["scores"]
+    smoothed = data["smoothed_scores"]
+    events = data["events"]
+    summary = data["summary"]
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.fill_between(times, scores, alpha=0.3, color="blue", label="Raw sentiment")
+    ax.plot(times, smoothed, color="red", linewidth=2, label="Smoothed pulse")
+    ax.axhline(y=0, color="gray", linestyle="--", linewidth=0.5)
+
+    if events:
+        for ev in events:
+            ev_time = datetime.fromisoformat(ev["time"])
+            ax.annotate(ev["message"], xy=(ev_time, ev["score"]),
+                        xytext=(10, 10), textcoords="offset points",
+                        arrowprops=dict(arrowstyle="->", color="purple"),
+                        fontsize=8, color="purple")
+
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Sentiment Score")
+    ax.set_title("Git Pulse - Repo Emotional Heartbeat")
+    ax.legend()
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+    plt.xticks(rotation=45)
+
+    if not no_summary:
+        textstr = f"Mean: {summary['mean_score']:.3f}\nStd: {summary['std_score']:.3f}\nMax: {summary['max_score']:.3f}\nMin: {summary['min_score']:.3f}
