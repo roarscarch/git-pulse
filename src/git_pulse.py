@@ -38,76 +38,69 @@ def get_git_log(repo_path: str = ".", max_count: int = 1000, progress_callback: 
             capture_output=True,
             text=True,
             check=True,
-            timeout=30
         )
         total_commits = int(total_result.stdout.strip())
-        if total_commits == 0:
-            return []
-        if max_count > 0:
-            total_commits = min(total_commits, max_count)
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"Failed to get commit count: {e.stderr.strip()}") from e
-    except (ValueError, OSError) as e:
-        raise RuntimeError(f"Failed to parse commit count: {e}") from e
+    except (subprocess.CalledProcessError, ValueError, FileNotFoundError):
+        raise RuntimeError("Failed to get commit count. Is this a git repository?")
+
+    # Limit to max_count
+    count = min(total_commits, max_count)
+    if count == 0:
+        return []
 
     try:
         result = subprocess.run(
-            ["git", "-C", repo_path, "log", f"--max-count={max_count}",
-             f"--format={LOG_FORMAT}", "--no-color"],
+            ["git", "-C", repo_path, "log", f"--max-count={count}", f"--format={LOG_FORMAT}"],
             capture_output=True,
             text=True,
             check=True,
-            timeout=60
         )
         lines = result.stdout.strip().split("\n")
-        if len(lines) == 1 and lines[0] == "":
+        if lines == [""]:
             return []
 
         if progress_callback:
-            progress_callback(len(lines), total_commits)
+            for i in range(len(lines)):
+                progress_callback(i + 1, len(lines))
 
         return lines
     except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"Git command failed: {e.stderr.strip()}") from e
-    except OSError as e:
-        raise RuntimeError(f"Failed to execute git: {e}") from e
+        raise RuntimeError(f"Git command failed: {e.stderr}")
+    except FileNotFoundError:
+        raise RuntimeError("Git executable not found. Ensure git is installed and in PATH.")
 
 
-def parse_log_entry(entry: str) -> Tuple[datetime, str]:
-    """Parse a single git log entry into a (timestamp, message) tuple.
+def parse_log_entry(entry: str) -> Optional[Tuple[datetime, str]]:
+    """Parse a single log entry line into (datetime, message).
 
     Args:
-        entry: A string in the format "timestamp||message".
+        entry: A log entry string in format 'timestamp||message'.
 
     Returns:
-        Tuple of (datetime, message).
-
-    Raises:
-        ValueError: If the entry cannot be parsed.
+        Tuple of (datetime, message) or None if parsing fails.
     """
     parts = entry.split("||", 1)
     if len(parts) != 2:
-        raise ValueError(f"Invalid log entry format: {entry[:50]}...")
+        return None
     timestamp_str, message = parts
-    # Parse timestamp in format: 2023-01-15 10:30:00 -0500
-    # We ignore the timezone offset for simplicity
+    # Git log format %ci gives 'YYYY-MM-DD HH:MM:SS +/-TTTT'
     try:
-        timestamp = datetime.strptime(timestamp_str[:19], "%Y-%m-%d %H:%M:%S")
-    except ValueError as e:
-        raise ValueError(f"Failed to parse timestamp '{timestamp_str}': {e}")
-    return timestamp, message.strip()
+        # Remove timezone offset for parsing
+        ts_clean = re.sub(r"\s[+-]\d{4}$", "", timestamp_str)
+        dt = datetime.strptime(ts_clean, "%Y-%m-%d %H:%M:%S")
+        return dt, message.strip()
+    except ValueError:
+        return None
 
 
 def analyze_sentiment(message: str) -> float:
-    """Analyze the sentiment of a commit message.
-
-    Uses TextBlob to compute polarity score (-1.0 to 1.0).
+    """Analyze sentiment of a commit message using TextBlob.
 
     Args:
-        message: The commit message.
+        message: The commit message string.
 
     Returns:
-        Sentiment polarity score.
+        Polarity score from -1.0 (negative) to 1.0 (positive).
     """
     if not message:
         return 0.0
@@ -115,18 +108,79 @@ def analyze_sentiment(message: str) -> float:
     return blob.sentiment.polarity
 
 
-def bin_sentiments(entries: List[Tuple[datetime, float]], bin_type: str = "day") -> Tuple[List[datetime], List[float]]:
-    """Bin sentiment scores by hour or day.
+def bin_sentiments(entries: List[Tuple[datetime, float]], bin_by: str = "day") -> List[Tuple[datetime, float, int]]:
+    """Bin sentiment scores by time period.
 
     Args:
-        entries: List of (timestamp, sentiment) tuples.
-        bin_type: Either 'hour' or 'day'.
+        entries: List of (datetime, score) tuples from parsed commits.
+        bin_by: Either 'hour' or 'day'.
 
     Returns:
-        Tuple of (bin_times, average_sentiments) where bin_times are the start of each bin.
+        List of (binned_datetime, average_score, count) sorted chronologically.
     """
-    if not entries:
-        return [], []
+    from collections import defaultdict
 
-    # Round timestamps to bin boundaries
-    bins = {}
+    bins = defaultdict(list)
+    for dt, score in entries:
+        if bin_by == "hour":
+            key = dt.replace(minute=0, second=0, microsecond=0)
+        else:
+            key = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        bins[key].append(score)
+
+    result = []
+    for key in sorted(bins.keys()):
+        scores = bins[key]
+        avg = sum(scores) / len(scores)
+        result.append((key, avg, len(scores)))
+    return result
+
+
+def smooth_signal(data: List[Tuple[datetime, float]], window: int = 5, polyorder: int = 2) -> List[Tuple[datetime, float]]:
+    """Apply Savitzky-Golay filter to smooth the sentiment signal.
+
+    Args:
+        data: List of (datetime, score) tuples.
+        window: Window length (must be odd).
+        polyorder: Polynomial order.
+
+    Returns:
+        List of (datetime, smoothed_score) tuples.
+    """
+    if len(data) < window:
+        return data
+
+    try:
+        from scipy.signal import savgol_filter
+        scores = np.array([s for _, s in data])
+        smoothed = savgol_filter(scores, window, polyorder)
+        return [(dt, float(s)) for dt, s in zip([d for d, _ in data], smoothed)]
+    except ImportError:
+        # Fallback: simple moving average
+        half = window // 2
+        smoothed = []
+        for i in range(len(data)):
+            start = max(0, i - half)
+            end = min(len(data), i + half + 1)
+            avg = sum(s for _, s in data[start:end]) / (end - start)
+            smoothed.append((data[i][0], avg))
+        return smoothed
+
+
+def detect_events(entries: List[Tuple[datetime, str]], keywords: List[str]) -> List[Tuple[datetime, str]]:
+    """Detect major events from commit messages based on keywords.
+
+    Args:
+        entries: List of (datetime, message) tuples.
+        keywords: List of keywords to search for in messages (case-insensitive).
+
+    Returns:
+        List of (datetime, matched_message) tuples for commits that contain any keyword.
+    """
+    events = []
+    for dt, message in entries:
+        lower_msg = message.lower()
+        matched_keywords = [kw for kw in keywords if kw.lower() in lower_msg]
+        if matched_keywords:
+            events.append((dt, message))
+    return events
